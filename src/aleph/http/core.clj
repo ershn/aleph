@@ -114,19 +114,13 @@
       default-value
       (if-let [e (find added k)]
         (val e)
-        (let [k' (str/lower-case (name k))]
-          (if-let [v (->> headers
-                       .entries
-                       (reduce
-                         (fn [v ^Map$Entry e]
-                           (if (= k' (str/lower-case (.getKey e)))
-                             (if v
-                               (str v "," (.getValue e))
-                               (.getValue e))
-                             v))
-                         nil))]
-            v
-            default-value))))))
+        (let [k' (str/lower-case (name k))
+              vs (.getAll headers k')]
+          (if (.isEmpty vs)
+            default-value
+            (if (== 1 (.size vs))
+              (.get vs 0)
+              (str/join "," vs))))))))
 
 (defn headers->map [^HttpHeaders h]
   (HeaderMap. h nil nil nil))
@@ -135,8 +129,15 @@
   (doseq [e m]
     (let [k (normalize-header-key (key e))
           v (val e)]
-      (if (sequential? v)
+
+      (cond
+        (nil? v)
+        (throw (IllegalArgumentException. (str "nil value for header key '" k "'")))
+
+        (sequential? v)
         (.add h ^CharSequence k ^Iterable v)
+
+        :else
         (.add h ^CharSequence k ^Object v)))))
 
 (defn ring-response->netty-response [m]
@@ -182,23 +183,22 @@
    ^AtomicBoolean websocket?
    question-mark-index
    body]
-  :scheme (if ssl? :https :http)
-  :keep-alive? (HttpHeaders/isKeepAlive req)
-  :request-method (-> req .getMethod .name str/lower-case keyword)
-  :headers (-> req .headers headers->map)
   :uri (let [idx (long question-mark-index)]
          (if (neg? idx)
            (.getUri req)
            (.substring (.getUri req) 0 idx)))
-  :query-string (let [idx (long question-mark-index)
-                      uri (.getUri req)]
-                  (if (neg? idx)
+  :query-string (let [uri (.getUri req)]
+                  (if (neg? question-mark-index)
                     nil
-                    (.substring uri (unchecked-inc idx))))
+                    (.substring uri (unchecked-inc question-mark-index))))
+  :headers (-> req .headers headers->map)
+  :request-method (-> req .getMethod .name str/lower-case keyword)
+  :body body
+  :scheme (if ssl? :https :http)
+  :keep-alive? (HttpHeaders/isKeepAlive req)
   :server-name (some-> ch ^InetSocketAddress (.localAddress) .getHostName)
   :server-port (some-> ch ^InetSocketAddress (.localAddress) .getPort)
-  :remote-addr (some-> ch ^InetSocketAddress (.remoteAddress) .getAddress .getHostAddress)
-  :body body)
+  :remote-addr (some-> ch ^InetSocketAddress (.remoteAddress) .getAddress .getHostAddress))
 
 (p/def-derived-map NettyResponse [^HttpResponse rsp complete body]
   :status (-> rsp .getStatus .code)
@@ -219,6 +219,10 @@
   (->NettyResponse rsp complete body))
 
 ;;;
+
+(defn try-set-content-length! [^HttpMessage msg ^long length]
+  (when-not (-> msg .headers (.contains "Content-Length"))
+    (HttpHeaders/setContentLength msg length)))
 
 (def empty-last-content LastHttpContent/EMPTY_LAST_CONTENT)
 
@@ -284,12 +288,16 @@
       (s/connect src sink)
 
       (let [d (d/deferred)]
-        (s/on-closed sink #(d/success! d true))
-        (d/chain' d
-          (fn [_]
+        (s/on-closed sink
+          (fn []
+
             (when (instance? Closeable body)
               (.close ^Closeable body))
-            (netty/write-and-flush ch empty-last-content)))))
+
+            (.execute (-> ch aleph.netty/channel .eventLoop)
+              #(d/success! d
+                 (netty/write-and-flush ch empty-last-content)))))
+        d))
 
     (netty/write-and-flush ch empty-last-content)))
 
@@ -298,7 +306,7 @@
         len (.length raf)
         fc (.getChannel raf)
         fr (DefaultFileRegion. fc 0 len)]
-    (HttpHeaders/setContentLength msg len)
+    (try-set-content-length! msg len)
     (netty/write ch msg)
     (netty/write ch fr)
     (netty/write-and-flush ch empty-last-content)))
@@ -306,12 +314,29 @@
 (defn send-contiguous-body [ch ^HttpMessage msg body]
   (let [body (if body
                (DefaultLastHttpContent. (netty/to-byte-buf ch body))
-               empty-last-content)]
-    (HttpHeaders/setContentLength msg (-> ^HttpContent body .content .readableBytes))
+               empty-last-content)
+        length (-> ^HttpContent body .content .readableBytes)]
+    (if (instance? HttpResponse msg)
+      (let [code (-> ^HttpResponse msg .getStatus .code)]
+        (when-not (or (<= 100 code 199) (= 204 code))
+          (try-set-content-length! msg length)))
+      (try-set-content-length! msg length))
     (netty/write ch msg)
     (netty/write-and-flush ch body)))
 
-(let [ary-class (class (byte-array 0))]
+(let [ary-class (class (byte-array 0))
+
+      ;; extracted to make `send-message` more inlineable
+      handle-cleanup
+      (fn [ch f]
+        (-> f
+          (d/chain'
+            (fn [^ChannelFuture f]
+              (if f
+                (.addListener f ChannelFutureListener/CLOSE)
+                (netty/close ch))))
+          (d/catch' (fn [_]))))]
+
   (defn send-message
     [ch keep-alive? ^HttpMessage msg body]
 
@@ -337,12 +362,6 @@
                     (log/error e "error sending body of type " class-name)))))]
 
       (when-not keep-alive?
-        (-> f
-          (d/chain'
-            (fn [^ChannelFuture f]
-              (if f
-                (.addListener f ChannelFutureListener/CLOSE)
-                (netty/close ch))))
-          (d/catch (fn [_]))))
+        (handle-cleanup ch f))
 
       f)))

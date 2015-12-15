@@ -11,7 +11,8 @@
     [java.util
      EnumSet
      TimeZone
-     Date]
+     Date
+     Locale]
     [java.text
      DateFormat
      SimpleDateFormat]
@@ -72,7 +73,7 @@
   (let [^DateFormat format
         (or
           (.get date-format)
-          (let [format (SimpleDateFormat. "EEE, dd MMM yyyy HH:mm:ss z")]
+          (let [format (SimpleDateFormat. "EEE, dd MMM yyyy HH:mm:ss z" Locale/ENGLISH)]
             (.setTimeZone format (TimeZone/getTimeZone "GMT"))
             (.set date-format format)
             format))]
@@ -83,7 +84,7 @@
     (.get ref)
     (let [ref (AtomicReference. (HttpHeaders/newEntity (rfc-1123-date-string)))]
       (.set date-value ref)
-      (.scheduleWithFixedDelay (.executor ctx)
+      (.scheduleAtFixedRate (.executor ctx)
         #(.set ref (HttpHeaders/newEntity (rfc-1123-date-string)))
         1000
         1000
@@ -102,7 +103,7 @@
       (map #(HttpHeaders/newEntity %) ["Server" "Connection" "Date"])
 
       [server-value keep-alive-value close-value]
-      (map #(HttpHeaders/newEntity %) ["Aleph/0.4.0" "Keep-Alive" "Close"])]
+      (map #(HttpHeaders/newEntity %) ["Aleph/0.4.1" "Keep-Alive" "Close"])]
   (defn send-response
     [^ChannelHandlerContext ctx keep-alive? rsp]
     (let [[^HttpResponse rsp body]
@@ -203,7 +204,7 @@
               executor
               req
               @previous-response
-              body
+              (when body (bs/to-input-stream body))
               (HttpHeaders/isKeepAlive req))))
 
         process-request
@@ -215,7 +216,7 @@
                 HttpResponseStatus/CONTINUE)))
 
           (if (HttpHeaders/isTransferEncodingChunked req)
-            (let [s (s/buffered-stream #(alength ^bytes %) buffer-capacity)]
+            (let [s (netty/buffered-source (netty/channel ctx) #(alength ^bytes %) buffer-capacity)]
               (reset! stream s)
               (handle-request ctx req s))
             (reset! request req)))
@@ -269,7 +270,7 @@
                   ;; buffer size exceeded, flush it as a stream
                   (when (< buffer-capacity size)
                     (let [bufs @buffer
-                          s (doto (s/buffered-stream #(alength ^bytes %) buffer-capacity)
+                          s (doto (netty/buffered-source (netty/channel ctx) #(alength ^bytes %) buffer-capacity)
                               (s/put! (netty/bufs->array bufs)))]
 
                       (doseq [b bufs]
@@ -350,15 +351,17 @@
                   HttpVersion/HTTP_1_1
                   HttpResponseStatus/CONTINUE)))
 
-            (let [s (s/buffered-stream #(.readableBytes ^ByteBuf %) buffer-capacity)]
+            (let [s (netty/buffered-source (netty/channel ctx) #(.readableBytes ^ByteBuf %) buffer-capacity)]
               (reset! stream s)
               (handle-request ctx req s)))
 
           (instance? HttpContent msg)
           (let [content (.content ^HttpContent msg)]
-            (netty/put! (.channel ctx) @stream content)
-            (when (instance? LastHttpContent msg)
-              (s/close! @stream))))))))
+            (if (instance? LastHttpContent msg)
+              (do
+                (s/put! @stream content)
+                (s/close! @stream))
+              (netty/put! (.channel ctx) @stream content))))))))
 
 (defn pipeline-builder
   [handler
@@ -394,17 +397,6 @@
 
 ;;;
 
-(defn wrap-stream->input-stream
-  [f
-   {:keys [request-buffer-size]
-    :or {request-buffer-size 16384}}]
-  (let [opts {:buffer-size request-buffer-size}]
-    (fn [{:keys [body] :as req}]
-      (f
-        (assoc req :body
-          (when body
-            (bs/to-input-stream body opts)))))))
-
 (defn start-server
   [handler
    {:keys [port
@@ -415,10 +407,12 @@
            pipeline-transform
            ssl-context
            shutdown-executor?
-           rejected-handler]
+           rejected-handler
+           epoll?]
     :or {bootstrap-transform identity
          pipeline-transform identity
-         shutdown-executor? true}
+         shutdown-executor? true
+         epoll? false}
     :as options}]
   (let [executor (cond
                    (instance? Executor executor)
@@ -426,7 +420,9 @@
 
                    (nil? executor)
                    (flow/utilization-executor 0.9 512
-                     {:metrics (EnumSet/of Stats$Metric/UTILIZATION)})
+                     {:metrics (EnumSet/of Stats$Metric/UTILIZATION)
+                      ;;:onto? false
+                      })
 
                    (= :none executor)
                    nil
@@ -437,33 +433,37 @@
                        (str "invalid executor specification: " (pr-str executor)))))]
     (netty/start-server
       (pipeline-builder
-        (if raw-stream?
-          handler
-          (wrap-stream->input-stream handler options))
+        handler
         pipeline-transform
         (assoc options :executor executor :ssl? (boolean ssl-context)))
       ssl-context
       bootstrap-transform
       (when (and shutdown-executor? (instance? ExecutorService executor))
         #(.shutdown ^ExecutorService executor))
-      (if socket-address socket-address (InetSocketAddress. port)))))
+      (if socket-address socket-address (InetSocketAddress. port))
+      epoll?)))
 
 ;;;
 
-(defn websocket-server-handler [raw-stream? ^Channel ch ^WebSocketServerHandshaker handshaker]
+(defn websocket-server-handler
+  [raw-stream?
+   ^Channel ch
+   ^WebSocketServerHandshaker handshaker]
   (let [d (d/deferred)
         out (netty/sink ch false
               #(if (instance? CharSequence %)
                  (TextWebSocketFrame. (bs/to-string %))
                  (BinaryWebSocketFrame. (netty/to-byte-buf ch %))))
-        in (s/stream 16)]
+        in (netty/buffered-source ch (constantly 1) 16)]
 
     (s/on-drained in
       #(d/chain' (.close handshaker ch (CloseWebSocketFrame.))
          netty/wrap-future
          (fn [_] (.close ch))))
 
-    [(s/splice out in)
+    [(doto
+       (s/splice out in)
+       (reset-meta! {:aleph/channel ch}))
 
      (netty/channel-handler
 
@@ -532,7 +532,7 @@
               h (DefaultHttpHeaders.)]
           (http/map->headers! h headers)
           (-> (try
-                (.handshake handshaker ch req h p)
+                (.handshake handshaker ch ^HttpRequest req h p)
                 (netty/wrap-future p)
                 (catch Throwable e
                   (d/error-deferred e)))

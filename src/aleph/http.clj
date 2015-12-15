@@ -24,7 +24,6 @@
    |:---------|:-------------
    | `port` | the port the server will bind to.  If `0`, the server will bind to a random port.
    | `socket-address` |  a `java.net.SocketAddress` specifying both the port and interface to bind to.
-   | `ssl-context` | an `io.netty.handler.ssl.SslContext` object. If a self-signed certificate is all that's required, `(aleph.netty/self-signed-ssl-context)` will suffice.
    | `bootstrap-transform` | a function that takes an `io.netty.bootstrap.ServerBootstrap` object, which represents the server, and modifies it.
    | `pipeline-transform` | a function that takes an `io.netty.channel.ChannelPipeline` object, which represents a connection, and modifies it.
    | `executor` | a `java.util.concurrent.Executor` which is used to handle individual requests.  To avoid this indirection you may specify `:none`, but in this case extreme care must be taken to avoid blocking operations on the handler's thread.
@@ -74,7 +73,7 @@
   (swap! connection-stats-callbacks disj c))
 
 (def default-response-executor
-  (flow/utilization-executor 0.9 256))
+  (flow/utilization-executor 0.9 256 {:onto? false}))
 
 (defn connection-pool
   "Returns a connection pool which can be used as an argument in `request`.
@@ -88,6 +87,7 @@
    the `connection-options` are a map describing behavior across all connections:
 
    |:---|:---
+   | `ssl-context` | an `io.netty.handler.ssl.SslContext` object, only required if a custom context is required
    | `local-address` | an optional `java.net.SocketAddress` describing which local interface should be used
    | `bootstrap-transform` | a function that takes an `io.netty.bootstrap.ServerBootstrap` object, which represents the server, and modifies it.
    | `pipeline-transform` | a function that takes an `io.netty.channel.ChannelPipeline` object, which represents a connection, and modifies it.
@@ -147,10 +147,12 @@
    |:---|:---
    | `raw-stream?` | if `true`, the connection will emit raw `io.netty.buffer.ByteBuf` objects rather than strings or byte-arrays.  This will minimize copying, but means that care must be taken with Netty's buffer reference counting.  Only recommended for advanced users.
    | `insecure?` | if `true`, the certificates for `wss://` will be ignored.
+   | `extensions?` | if `true`, the websocket extensions will be supported.
+   | `sub-protocols` | a string with a comma seperated list of supported sub-protocls.
    | `headers` | the headers that should be included in the handshake"
   ([url]
     (websocket-client url nil))
-  ([url {:keys [raw-stream? insecure? headers] :as options}]
+  ([url {:keys [raw-stream? insecure? sub-protocols extensions? headers] :as options}]
     (client/websocket-connection url options)))
 
 (defn websocket-connection
@@ -211,7 +213,7 @@
                    (maybe-timeout! connection-timeout)
 
                    ;; connection failed, bail out
-                   (d/catch
+                   (d/catch'
                      (fn [e]
                        (flow/dispose pool k conn)
                        (d/error-deferred e)))
@@ -236,7 +238,7 @@
                              (maybe-timeout! request-timeout)
 
                              ;; request failed, if it was due to a timeout close the connection
-                             (d/catch
+                             (d/catch'
                                (fn [e]
                                  (if (instance? TimeoutException e)
                                    (flow/dispose pool k conn)
@@ -250,7 +252,7 @@
                                 ;; only release the connection back once the response is complete
                                  (d/chain' (:aleph/complete rsp)
                                    (fn [early?]
-                                     (if early?
+                                     (if (or early? (not (:keep-alive? rsp)))
                                        (flow/dispose pool k conn)
                                        (flow/release pool k conn))))
                                  (-> rsp
@@ -268,10 +270,10 @@
   ([method url]
     (req method url nil))
   ([method url options]
-     (request
-       (assoc options
-         :request-method method
-         :url url))))
+    (request
+      (assoc options
+        :request-method method
+        :url url))))
 
 (def ^:private arglists
   '[[url]
@@ -302,3 +304,9 @@
 (def-http-method head)
 (def-http-method delete)
 (def-http-method connect)
+
+(defn get-all
+  "Given a header map from an HTTP request or response, returns a collection of values associated with the key,
+   rather than a comma-delimited string."
+  [^aleph.http.core.HeaderMap headers ^String k]
+  (-> headers ^io.netty.handler.codec.http.HttpHeaders (.headers) (.getAll k)))

@@ -3,6 +3,7 @@
     [compojure.core :as compojure :refer [GET]]
     [ring.middleware.params :as params]
     [compojure.route :as route]
+    [compojure.response :refer [Renderable]]
     [aleph.http :as http]
     [byte-streams :as bs]
     [manifold.stream :as s]
@@ -41,15 +42,26 @@
     1000
     (hello-world-handler req)))
 
+;; Compojure will normally dereference deferreds and return the realized value.
+;; This unfortunately blocks the thread. Since aleph can accept the un-realized
+;; deferred, we extend compojure's Renderable protocol to pass the deferred
+;; through unchanged so that the thread won't be blocked.
+
+(extend-protocol Renderable
+  manifold.deferred.Deferred
+  (render [d _] d))
+
 (defn delayed-hello-world-handler
   "Alternately, we can use a [core.async](https://github.com/clojure/core.async) goroutine to
    create our response, and convert the channel it returns using
-   `manifold.deferred/->deferred`. This is entirely equivalent to the previous implementation."
+   `manifold.deferred/->source`, and then take the first message from it. This is entirely equivalent
+   to the previous implementation."
   [req]
-  (d/->deferred
-    (a/go
-      (let [_ (a/<! (a/timeout 1000))]
-        (hello-world-handler req)))))
+  (s/take!
+    (s/->source
+      (a/go
+        (let [_ (a/<! (a/timeout 1000))]
+          (hello-world-handler req))))))
 
 (defn streaming-numbers-handler
   "Returns a streamed HTTP response, consisting of newline-delimited numbers every 100

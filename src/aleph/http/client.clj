@@ -12,6 +12,7 @@
      IOException]
     [java.net
      URI
+     URL
      InetSocketAddress]
     [io.netty.buffer
      ByteBuf
@@ -52,25 +53,28 @@
 
 ;;;
 
-(defn req->domain [req]
-  (if-let [url (:url req)]
-    (let [^URI uri (URI. url)]
-      (URI.
-        (.getScheme uri)
-        nil
-        (.getHost uri)
-        (.getPort uri)
-        nil
-        nil
-        nil))
-    (URI.
-      (name (or (:scheme req) :http))
-      "nil"
-      (:host req)
-      (or (:port req) -1)
-      nil
-      nil
-      nil)))
+(let [no-url (fn [req]
+               (URI.
+                 (name (or (:scheme req) :http))
+                 nil
+                 (:host req)
+                 (or (:port req) -1)
+                 nil
+                 nil
+                 nil))]
+
+  (defn req->domain [req]
+    (if-let [url (:url req)]
+      (let [^URL uri (URL. url)]
+        (URI.
+          (.getProtocol uri)
+          nil
+          (.getHost uri)
+          (.getPort uri)
+          nil
+          nil
+          nil))
+      (no-url req))))
 
 (defn raw-client-handler
   [response-stream buffer-capacity]
@@ -105,7 +109,7 @@
           (instance? HttpResponse msg)
           (let [rsp msg]
 
-            (let [s (s/buffered-stream #(.readableBytes ^ByteBuf %) buffer-capacity)
+            (let [s (netty/buffered-source (netty/channel ctx) #(.readableBytes ^ByteBuf %) buffer-capacity)
                   c (d/deferred)]
               (reset! stream s)
               (reset! complete c)
@@ -150,13 +154,13 @@
 
       :channel-read
       ([_ ctx msg]
+
         (cond
 
           (instance? HttpResponse msg)
           (let [rsp msg]
-
             (if (HttpHeaders/isTransferEncodingChunked rsp)
-              (let [s (s/buffered-stream #(alength ^bytes %) buffer-capacity)
+              (let [s (netty/buffered-source (netty/channel ctx) #(alength ^bytes %) buffer-capacity)
                     c (d/deferred)]
                 (reset! stream s)
                 (reset! complete c)
@@ -206,7 +210,7 @@
                     (when (< buffer-capacity size)
                       (let [bufs @buffer
                             c (d/deferred)
-                            s (doto (s/buffered-stream #(alength ^bytes %) 16384)
+                            s (doto (netty/buffered-source (netty/channel ctx) #(alength ^bytes %) 16384)
                                 (s/put! (netty/bufs->array bufs)))]
 
                         (doseq [b bufs]
@@ -266,15 +270,18 @@
            pipeline-transform
            keep-alive?
            insecure?
+           ssl-context
            response-buffer-size
            on-closed
-           response-executor]
+           response-executor
+           epoll?]
     :or {bootstrap-transform identity
          keep-alive? true
-         response-buffer-size 65536}
+         response-buffer-size 65536
+         epoll? false}
     :as options}]
   (let [responses (s/stream 1024 nil response-executor)
-        requests (s/stream 1024)
+        requests (s/stream 1024 nil nil)
         host (.getHostName ^InetSocketAddress remote-address)
         c (netty/create-client
             (pipeline-builder
@@ -283,13 +290,15 @@
                 (assoc options :pipeline-transform pipeline-transform)
                 options))
             (when ssl?
-              (if insecure?
-                (netty/insecure-ssl-client-context)
-                (netty/ssl-client-context)))
+              (or ssl-context
+                (if insecure?
+                  (netty/insecure-ssl-client-context)
+                  (netty/ssl-client-context))))
             bootstrap-transform
             remote-address
-            local-address)]
-    (d/chain c
+            local-address
+            epoll?)]
+    (d/chain' c
       (fn [^Channel ch]
 
         (s/consume
@@ -315,7 +324,7 @@
                   rsp (locking ch
                         (s/put! requests req)
                         (s/take! responses ::closed))]
-              (d/chain rsp
+              (d/chain' rsp
                 (fn [rsp]
                   (cond
                     (identical? ::closed rsp)
@@ -325,7 +334,7 @@
                     rsp
 
                     :else
-                    (d/chain rsp
+                    (d/chain' rsp
                       (fn [rsp]
                         (let [body (:body rsp)]
 
@@ -345,18 +354,18 @@
 (defn websocket-frame-size [^WebSocketFrame frame]
   (-> frame .content .readableBytes))
 
-(defn ^WebSocketClientHandshaker websocket-handshaker [uri headers]
+(defn ^WebSocketClientHandshaker websocket-handshaker [uri sub-protocols extensions? headers]
   (WebSocketClientHandshakerFactory/newHandshaker
     uri
     WebSocketVersion/V13
-    nil
-    false
+    sub-protocols
+    extensions?
     (doto (DefaultHttpHeaders.) (http/map->headers! headers))))
 
-(defn websocket-client-handler [raw-stream? uri headers]
+(defn websocket-client-handler [raw-stream? uri sub-protocols extensions? headers]
   (let [d (d/deferred)
-        in (s/stream 16)
-        handshaker (websocket-handshaker uri headers)]
+        in (atom nil)
+        handshaker (websocket-handshaker uri sub-protocols extensions? headers)]
 
     [d
 
@@ -366,7 +375,7 @@
        ([_ ctx ex]
          (when-not (d/error! d ex)
            (log/warn ex "error in websocket client"))
-         (s/close! in)
+         (s/close! @in)
          (netty/close ctx))
 
        :channel-inactive
@@ -377,6 +386,7 @@
        :channel-active
        ([_ ctx]
          (let [ch (.channel ctx)]
+           (reset! in (netty/buffered-source ch (constantly 1) 16))
            (.handshake handshaker ch)))
 
        :channel-read
@@ -393,10 +403,13 @@
                                 (TextWebSocketFrame. (bs/to-string %))
                                 (BinaryWebSocketFrame. (netty/to-byte-buf ctx %))))]
 
-                   (d/success! d (s/splice out in))
+                   (d/success! d
+                     (doto
+                       (s/splice out @in)
+                       (reset-meta! {:aleph/channel ch})))
 
-                   (s/on-drained in
-                     #(d/chain (.writeAndFlush ch (CloseWebSocketFrame.))
+                   (s/on-drained @in
+                     #(d/chain' (.writeAndFlush ch (CloseWebSocketFrame.))
                         netty/wrap-future
                         (fn [_] (netty/close ctx))))))
 
@@ -411,11 +424,11 @@
                        "'"))))
 
                (instance? TextWebSocketFrame msg)
-               (netty/put! ch in (.text ^TextWebSocketFrame msg))
+               (netty/put! ch @in (.text ^TextWebSocketFrame msg))
 
                (instance? BinaryWebSocketFrame msg)
                (let [frame (netty/acquire (.content ^BinaryWebSocketFrame msg))]
-                 (netty/put! ch in
+                 (netty/put! ch @in
                    (if raw-stream?
                      frame
                      (netty/buf->array frame))))
@@ -430,18 +443,22 @@
 
 (defn websocket-connection
   [uri
-   {:keys [raw-stream? bootstrap-transform insecure? headers local-address]
+   {:keys [raw-stream? bootstrap-transform insecure? headers local-address epoll?
+           sub-protocols extensions?]
     :or {bootstrap-transform identity
          keep-alive? true
-         raw-stream? false}
+         raw-stream? false
+         epoll? false
+         sub-protocols nil
+         extensions? false}
     :as options}]
   (let [uri (URI. uri)
         ssl? (= "wss" (.getScheme uri))
-        [s handler] (websocket-client-handler raw-stream? uri headers)]
+        [s handler] (websocket-client-handler raw-stream? uri sub-protocols extensions? headers)]
 
     (assert (#{"ws" "wss"} (.getScheme uri)) "scheme must be one of 'ws' or 'wss'")
 
-    (d/chain
+    (d/chain'
       (netty/create-client
         (fn [^ChannelPipeline pipeline]
           (doto pipeline
@@ -459,6 +476,7 @@
             (if (neg? (.getPort uri))
               (if ssl? 443 80)
               (.getPort uri))))
-        local-address)
+        local-address
+        epoll?)
       (fn [_]
         s))))

@@ -3,7 +3,9 @@
     [clojure test])
   (:require
     [clojure.java.io :as io]
-    [aleph.netty :as netty]
+    [aleph
+     [netty :as netty]
+     [flow :as flow]]
     [byte-streams :as bs]
     [manifold.deferred :as d]
     [manifold.stream :as s]
@@ -163,8 +165,10 @@
             body (:body
                    @(http/put "http://localhost:8080/echo"
                       {:body words
-                       :socket-timeout 2000}))]
-        (is (= words (bs/to-string body)))))))
+                       :socket-timeout 2000}))
+            body' (bs/to-string body)]
+        (assert (== (min (count words) len) (count body')))
+        (is (= words body'))))))
 
 (deftest test-redirect
   (with-both-handlers basic-handler
@@ -199,8 +203,15 @@
             body (:body
                    @(http/put "http://localhost:8080/line_echo"
                       {:body words
-                       :socket-timeout 2000}))]
+                       :socket-timeout 1e4}))]
         (is (= (.replace ^String words "\n" "") (bs/to-string body)))))))
+
+(deftest test-illegal-character-in-url
+  (with-handler hello-handler
+    (is (= "hello"
+           (-> @(http/get "http://localhost:8080/?param=illegal character")
+               :body
+               bs/to-string)))))
 
 (deftest test-connection-timeout
   (with-handler basic-handler
@@ -262,6 +273,18 @@
   (println "starting HTTP benchmark server on 8080")
   (netty/leak-detector-level! :disabled)
   (let [server (http/start-server hello-handler {:port 8080})]
-    (Thread/sleep (* 1000 600))
+    (Thread/sleep (* 1000 60))
+    (println "stopping server")
+    (.close ^java.io.Closeable server)))
+
+(deftest ^:benchmark benchmark-websockets
+  (println "starting WebSocket benchmark server on 8080")
+  (netty/leak-detector-level! :disabled)
+  (let [server (http/start-server
+                 (fn [req]
+                   (d/let-flow [s (http/websocket-connection req)]
+                     (s/consume #(s/put! s %) s)))
+                 {:port 8080})]
+    (Thread/sleep (* 1000 60))
     (println "stopping server")
     (.close ^java.io.Closeable server)))
