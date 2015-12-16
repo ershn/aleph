@@ -1,4 +1,4 @@
-(defproject aleph "0.4.1-SNAPSHOT"
+(defproject aleph "0.4.1-keldoc-SNAPSHOT"
   :description "a framework for asynchronous communication"
   :repositories {"jboss" "http://repository.jboss.org/nexus/content/groups/public/"
                  "sonatype-oss-public" "https://oss.sonatype.org/content/groups/public/"}
@@ -6,6 +6,7 @@
   :dependencies [[org.clojure/tools.logging "0.3.1" :exclusions [org.clojure/clojure]]
                  [io.netty/netty-all "4.1.0.Beta8"]
                  [io.aleph/dirigiste "0.1.2-alpha1"]
+                 [riddley "0.1.11"]
                  [manifold "0.1.1"]
                  [byte-streams "0.2.1-alpha1"]
                  [potemkin "0.4.2-alpha2"]]
