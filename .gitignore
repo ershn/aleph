@@ -6,6 +6,8 @@ classes
 push
 autodoc
 doc
+/.idea
+*.iml
 .lein*
 dump.rdb
 target/**
